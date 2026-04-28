@@ -575,6 +575,200 @@ def evaluate_virality():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/pipeline", methods=["POST"])
+def pipeline():
+    """Complete pipeline: remove silence → transcribe → evaluate → filter → render"""
+    data = request.json
+    video_path = data.get("video_path")
+    model_path = data.get("model_path")
+    save_folder = data.get("save_folder", "./output")
+    keep_silence_up_to = data.get("keep_silence_up_to", 0.3)
+    min_score = data.get("min_score", 6)
+    top_n = data.get("top_n", 3)
+    
+    if not video_path or not Path(video_path).exists():
+        return jsonify({"error": "Invalid video_path"}), 400
+    if not model_path or not Path(model_path).exists():
+        return jsonify({"error": "Invalid model_path"}), 400
+    
+    Path(save_folder).mkdir(parents=True, exist_ok=True)
+    pipeline_start = time.time()
+    results = {"steps": {}, "outputs": {}}
+    
+    try:
+        video_name = Path(video_path).stem
+        
+        # Step 1: Remove silence
+        t0 = time.time()
+        trimmed = os.path.join(save_folder, f"{video_name}_trimmed.mp4")
+        subprocess.run(["auto-editor", video_path, "-o", trimmed, "--margin", f"{keep_silence_up_to}sec", "--no-open"],
+                      capture_output=True, check=True)
+        results["steps"]["remove_silence"] = {"time": round(time.time() - t0, 2), "output": trimmed}
+        
+        # Step 2: Extract and optimize audio
+        t0 = time.time()
+        audio_raw = os.path.join(save_folder, f"{video_name}_audio.m4a")
+        audio_opt = os.path.join(save_folder, f"{video_name}_audio_opt.m4a")
+        subprocess.run(["ffmpeg", "-i", trimmed, "-q:a", "9", "-n", audio_raw], capture_output=True, check=True)
+        subprocess.run(["ffmpeg", "-i", audio_raw, "-af", "anlmdn=f=13:t=0.0001,loudnorm", "-ar", "16000", "-ac", "1",
+                       "-c:a", "aac", "-q:a", "8", "-y", audio_opt], capture_output=True, check=True)
+        results["steps"]["audio"] = {"time": round(time.time() - t0, 2), "output": audio_opt}
+        
+        # Step 3: Transcribe
+        t0 = time.time()
+        model = get_whisper_model("base")
+        segments, info = model.transcribe(audio_opt, word_level=True)
+        segments = list(segments)
+        vtt = os.path.join(save_folder, f"{video_name}.vtt")
+        with open(vtt, "w", encoding="utf-8") as f:
+            f.write("WEBVTT\n\n")
+            for seg in segments:
+                if seg.words:
+                    for word in seg.words:
+                        f.write(f"{_ms_to_vtt(word.start)} --> {_ms_to_vtt(word.end)}\n{word.word.strip()}\n\n")
+                else:
+                    f.write(f"{_ms_to_vtt(seg.start)} --> {_ms_to_vtt(seg.end)}\n{seg.text.strip()}\n\n")
+        results["steps"]["transcribe"] = {"time": round(time.time() - t0, 2), "language": info.language, "output": vtt}
+        
+        # Step 4: Extract windows
+        t0 = time.time()
+        with open(vtt, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        subtitles = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if " --> " in line:
+                parts = line.split(" --> ")
+                start, end = _parse_vtt_time(parts[0]), _parse_vtt_time(parts[1])
+                i += 1
+                text = []
+                while i < len(lines) and lines[i].strip() and " --> " not in lines[i]:
+                    text.append(lines[i].strip())
+                    i += 1
+                subtitles.append({"start": start, "end": end, "text": " ".join(text)})
+            else:
+                i += 1
+        
+        windows = []
+        max_time = max(s["end"] for s in subtitles)
+        for dur in range(30, 65, 5):
+            t = 0
+            while t + dur <= max_time:
+                txt = " ".join([s["text"] for s in subtitles if s["start"] < t + dur and s["end"] > t])
+                if txt.strip():
+                    windows.append({"duration": dur, "start": t, "end": t + dur, "text": txt})
+                t += 5
+        
+        win_file = os.path.join(save_folder, f"{video_name}_windows.txt")
+        with open(win_file, "w", encoding="utf-8") as f:
+            for w in windows:
+                f.write(f"[{w['duration']}s @ {w['start']:.0f}s-{w['end']:.0f}s] {w['text']}\n")
+        results["steps"]["windows"] = {"time": round(time.time() - t0, 2), "count": len(windows), "output": win_file}
+        
+        # Step 5: Evaluate virality
+        t0 = time.time()
+        llm = Llama(model_path=model_path, n_gpu_layers=35, n_ctx=512, verbose=False)
+        evals = []
+        for w in windows:
+            p = f"Rate the viral potential (1-10) of this video snippet and explain briefly in one sentence:\n\n{w['text'][:200]}\n\nVirality Score:"
+            out = llm(p, max_tokens=50, temperature=0.3, stop=["Score:", "\n"])
+            score_text = out["choices"][0]["text"].strip()
+            evals.append(f"[{w['duration']}s @ {w['start']:.0f}s-{w['end']:.0f}s] | {score_text}")
+        del llm
+        
+        eval_file = os.path.join(save_folder, f"{video_name}_evals.txt")
+        with open(eval_file, "w", encoding="utf-8") as f:
+            for e in evals:
+                f.write(e + "\n")
+        results["steps"]["evaluate"] = {"time": round(time.time() - t0, 2), "count": len(evals), "output": eval_file}
+        
+        # Step 6: Filter best candidates
+        t0 = time.time()
+        candidates = [{"line": e, "score": _extract_score(e), "window": w} 
+                     for e, w in zip(evals, windows) if _extract_score(e) >= min_score]
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        top = candidates[:top_n]
+        
+        cand_file = os.path.join(save_folder, f"{video_name}_candidates.txt")
+        with open(cand_file, "w", encoding="utf-8") as f:
+            for c in top:
+                f.write(c["line"] + "\n")
+        results["steps"]["filter"] = {"time": round(time.time() - t0, 2), "selected": len(top), "output": cand_file}
+        
+        # Step 7: Generate metadata and render shorts
+        t0 = time.time()
+        llm = Llama(model_path=model_path, n_gpu_layers=35, n_ctx=512, verbose=False)
+        probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                               "-show_entries", "stream=width,height", "-of", "csv=p=0", trimmed],
+                              capture_output=True, text=True).stdout.strip()
+        vw, vh = map(int, probe.split(','))
+        
+        ass_path = _vtt_to_ass(vtt, save_folder)
+        shorts_info = []
+        
+        for idx, cand in enumerate(top):
+            # Generate metadata
+            p = f"Analyze this video content snippet and provide metadata in this exact format:\nTAGS: tag1, tag2, tag3\nKEYWORDS: keyword1, keyword2, keyword3, keyword4\nTITLE: short title\nDESCRIPTION: 1-2 sentence description\nSHORT: brief 1-line description for display\n\nContent: {cand['window']['text'][:300]}\n\n"
+            out = llm(p, max_tokens=150, temperature=0.3, stop=["Content:"])
+            resp = out["choices"][0]["text"].strip()
+            
+            meta = {"tags": [], "keywords": [], "title": "", "description": "", "short_description": ""}
+            for line in resp.split("\n"):
+                if line.startswith("TAGS:"):
+                    meta["tags"] = [t.strip() for t in line.replace("TAGS:", "").split(",")]
+                elif line.startswith("KEYWORDS:"):
+                    meta["keywords"] = [k.strip() for k in line.replace("KEYWORDS:", "").split(",")]
+                elif line.startswith("TITLE:"):
+                    meta["title"] = line.replace("TITLE:", "").strip()
+                elif line.startswith("DESCRIPTION:"):
+                    meta["description"] = line.replace("DESCRIPTION:", "").strip()
+                elif line.startswith("SHORT:"):
+                    meta["short_description"] = line.replace("SHORT:", "").strip()
+            
+            # Render shorts
+            out_w, out_h = 1080, 1920
+            ratio = out_w / out_h
+            vid_ratio = vw / vh
+            scale_w = int(out_h * vid_ratio) if vid_ratio > ratio else out_w
+            scale_h = int(out_w / vid_ratio) if vid_ratio > ratio else out_h
+            off_x, off_y = (out_w - scale_w) // 2, (out_h - scale_h) // 2
+            
+            filt = f"[0:v]split=2[bg][main];[bg]scale={out_w}:{out_h},gblur=sigma=50[blurred];[main]scale={scale_w}:{scale_h}[scaled];[blurred][scaled]overlay={off_x}:{off_y}[final]"
+            shorts = os.path.join(save_folder, f"{video_name}_shorts_{idx+1}.mp4")
+            
+            subprocess.run(["ffmpeg", "-i", trimmed, "-vf", filt, "-vf", f"ass={ass_path}",
+                           "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "96k",
+                           "-y", shorts], capture_output=True, check=True, timeout=600)
+            
+            shorts_info.append({
+                "rank": idx + 1,
+                "virality_score": cand["score"],
+                "title": meta["title"],
+                "short_description": meta["short_description"],
+                "tags": meta["tags"],
+                "output_path": str(shorts)
+            })
+        
+        del llm
+        results["outputs"]["shorts"] = shorts_info
+        results["steps"]["render"] = {"time": round(time.time() - t0, 2), "count": len(shorts_info)}
+        
+        # Summary
+        results["video_path"] = str(video_path)
+        results["model_path"] = str(model_path)
+        results["save_folder"] = str(save_folder)
+        results["total_time_sec"] = round(time.time() - pipeline_start, 2)
+        results["status"] = "success"
+        
+        return jsonify(results), 200
+    
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Processing timeout"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/extract-subtitle-windows", methods=["POST"])
 def extract_subtitle_windows():
     data = request.json
@@ -660,3 +854,4 @@ def extract_subtitle_windows():
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
+
