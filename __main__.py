@@ -200,6 +200,158 @@ def _parse_vtt_time(time_str):
     parts = time_str.split(":")
     return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
 
+def _extract_score(evaluation_line):
+    """Extract numeric virality score from evaluation line"""
+    try:
+        # Format: "[30s @ 0s-30s] | score_text"
+        if "] | " in evaluation_line:
+            score_part = evaluation_line.split("] | ")[1]
+            # Extract first number (e.g., "7/10 - engaging" -> 7)
+            import re
+            match = re.search(r'^\d+', score_part)
+            if match:
+                return int(match.group())
+    except:
+        pass
+    return 0
+
+@app.route("/filter-best-candidates", methods=["POST"])
+def filter_best_candidates():
+    data = request.json
+    evaluations_path = data.get("evaluations_path")
+    min_score = data.get("min_score", 6)
+    top_n = data.get("top_n", 10)
+    save_folder = data.get("save_folder", "./output")
+    
+    if not evaluations_path or not Path(evaluations_path).exists():
+        return jsonify({"error": "Invalid evaluations_path"}), 400
+    
+    Path(save_folder).mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # Parse evaluations
+        candidates = []
+        with open(evaluations_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and "] | " in line:
+                    score = _extract_score(line)
+                    if score >= min_score:
+                        candidates.append({"line": line, "score": score})
+        
+        if not candidates:
+            return jsonify({"error": "No candidates meet min_score threshold"}), 400
+        
+        # Sort by score descending
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        top_candidates = candidates[:top_n]
+        
+        # Save filtered results
+        eval_name = Path(evaluations_path).stem.replace("_evaluations", "")
+        output_path = os.path.join(save_folder, f"{eval_name}_top_candidates.txt")
+        
+        with open(output_path, "w", encoding="utf-8") as f:
+            for c in top_candidates:
+                f.write(c["line"] + "\n")
+        
+        output_size_kb = Path(output_path).stat().st_size / 1024
+        
+        return jsonify({
+            "status": "success",
+            "evaluations_path": str(evaluations_path),
+            "min_score": min_score,
+            "top_n": top_n,
+            "total_evaluated": len(candidates) + sum(1 for line in open(evaluations_path) if line.strip() and "] | " in line and _extract_score(line) < min_score),
+            "candidates_filtered": len(candidates),
+            "candidates_selected": len(top_candidates),
+            "top_scores": [c["score"] for c in top_candidates],
+            "output_path": str(output_path),
+            "output_size_kb": round(output_size_kb, 2),
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/generate-metadata", methods=["POST"])
+def generate_metadata():
+    data = request.json
+    window_text = data.get("window_text")
+    model_path = data.get("model_path")
+    save_folder = data.get("save_folder", "./output")
+    
+    if not window_text or not model_path or not Path(model_path).exists():
+        return jsonify({"error": "Invalid window_text or model_path"}), 400
+    
+    Path(save_folder).mkdir(parents=True, exist_ok=True)
+    
+    try:
+        model = Llama(model_path=model_path, n_gpu_layers=35, n_ctx=512, verbose=False)
+        
+        # Generate metadata in one efficient prompt
+        prompt = f"""Analyze this video content snippet and provide metadata in this exact format:
+TAGS: tag1, tag2, tag3
+KEYWORDS: keyword1, keyword2, keyword3, keyword4
+TITLE: short title
+DESCRIPTION: 1-2 sentence description
+SHORT: brief 1-line description for display
+
+Content: {window_text[:300]}
+
+"""
+        
+        output = model(prompt, max_tokens=150, temperature=0.3, stop=["Content:"])
+        response_text = output["choices"][0]["text"].strip()
+        
+        # Parse metadata from response
+        metadata = {
+            "tags": [],
+            "keywords": [],
+            "title": "",
+            "description": "",
+            "short_description": ""
+        }
+        
+        for line in response_text.split("\n"):
+            if line.startswith("TAGS:"):
+                metadata["tags"] = [t.strip() for t in line.replace("TAGS:", "").split(",")]
+            elif line.startswith("KEYWORDS:"):
+                metadata["keywords"] = [k.strip() for k in line.replace("KEYWORDS:", "").split(",")]
+            elif line.startswith("TITLE:"):
+                metadata["title"] = line.replace("TITLE:", "").strip()
+            elif line.startswith("DESCRIPTION:"):
+                metadata["description"] = line.replace("DESCRIPTION:", "").strip()
+            elif line.startswith("SHORT:"):
+                metadata["short_description"] = line.replace("SHORT:", "").strip()
+        
+        del model
+        
+        # Save metadata
+        import hashlib
+        text_hash = hashlib.md5(window_text.encode()).hexdigest()[:8]
+        output_path = os.path.join(save_folder, f"metadata_{text_hash}.json")
+        
+        import json
+        metadata_with_context = {
+            **metadata,
+            "window_text": window_text,
+            "model_path": str(model_path),
+        }
+        
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(metadata_with_context, f, indent=2, ensure_ascii=False)
+        
+        output_size_kb = Path(output_path).stat().st_size / 1024
+        
+        return jsonify({
+            "status": "success",
+            "window_text": window_text,
+            "model_path": str(model_path),
+            **metadata,
+            "output_path": str(output_path),
+            "output_size_kb": round(output_size_kb, 2),
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/evaluate-virality", methods=["POST"])
 def evaluate_virality():
     data = request.json
