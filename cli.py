@@ -128,9 +128,26 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
         t0 = time.time()
         trimmed = os.path.join(save_folder, f"{video_name}_trimmed.mp4")
         subprocess.run(
-            ["auto-editor", video_path, "-o", trimmed, "--margin", f"{keep_silence_up_to}sec", "--no-open"],
+            ["auto-editor", video_path, "-o", trimmed, "--margin", f"{keep_silence_up_to}sec", 
+             "--no-open", "--video-codec", "h264", "--audio-codec", "aac"],
             capture_output=True, check=True, timeout=600
         )
+        # Verify output has video stream; if not, re-encode using ffmpeg
+        probe_result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type",
+             "-of", "default=noprint_wrappers=1:nokey=1", trimmed],
+            capture_output=True, text=True, timeout=10
+        )
+        if not probe_result.stdout.strip() or "video" not in probe_result.stdout:
+            print("(re-encoding to ensure video stream...)", end=" ", flush=True)
+            trimmed_backup = trimmed.replace(".mp4", "_backup.mp4")
+            os.rename(trimmed, trimmed_backup)
+            subprocess.run(
+                ["ffmpeg", "-i", trimmed_backup, "-c:v", "libx264", "-preset", "ultrafast",
+                 "-c:a", "aac", "-y", trimmed],
+                capture_output=True, check=True, timeout=600
+            )
+            os.remove(trimmed_backup)
         step_time = time.time() - t0
         results["steps"]["remove_silence"] = {"time": round(step_time, 2), "output": trimmed}
         print(f"✓ ({step_time:.1f}s)")
@@ -140,11 +157,19 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
         t0 = time.time()
         audio_raw = os.path.join(save_folder, f"{video_name}_audio.m4a")
         audio_opt = os.path.join(save_folder, f"{video_name}_audio_opt.m4a")
-        subprocess.run(["ffmpeg", "-i", trimmed, "-q:a", "9", "-n", audio_raw],
-                      capture_output=True, check=True, timeout=300)
-        subprocess.run(["ffmpeg", "-i", audio_raw, "-af", "anlmdn=f=13:t=0.0001,loudnorm",
-                       "-ar", "16000", "-ac", "1", "-c:a", "aac", "-q:a", "8", "-y", audio_opt],
-                      capture_output=True, check=True, timeout=300)
+        
+        # Extract audio with proper stream selection
+        subprocess.run(
+            ["ffmpeg", "-i", trimmed, "-q:a", "9", "-vn", "-c:a", "aac", "-y", audio_raw],
+            capture_output=True, check=True, timeout=300
+        )
+        
+        # Optimize audio with loudness normalization
+        subprocess.run(
+            ["ffmpeg", "-i", audio_raw, "-af", "anlmdn=f=13:t=0.0001,loudnorm",
+             "-ar", "16000", "-ac", "1", "-c:a", "aac", "-q:a", "8", "-y", audio_opt],
+            capture_output=True, check=True, timeout=300
+        )
         step_time = time.time() - t0
         results["steps"]["audio"] = {"time": round(step_time, 2), "output": audio_opt}
         print(f"✓ ({step_time:.1f}s)")
