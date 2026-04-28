@@ -2,8 +2,18 @@ import os
 import subprocess
 from pathlib import Path
 from flask import Flask, request, jsonify
+from faster_whisper import WhisperModel
 
 app = Flask(__name__)
+
+# Initialize Whisper model (lazy-loaded on first use)
+_model = None
+
+def get_whisper_model(model_size="base"):
+    global _model
+    if _model is None:
+        _model = WhisperModel(model_size, device="auto", compute_type="auto")
+    return _model
 
 def get_duration(video_path):
     """Get video duration in seconds"""
@@ -64,6 +74,67 @@ def remove_silence():
         return jsonify({"error": "auto-editor failed"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/transcribe", methods=["POST"])
+def transcribe():
+    data = request.json
+    audio_path = data.get("audio_path")
+    model_size = data.get("model_size", "base")
+    save_folder = data.get("save_folder", "./output")
+    language = data.get("language", None)
+    
+    if not audio_path or not Path(audio_path).exists():
+        return jsonify({"error": "Invalid audio_path"}), 400
+    
+    Path(save_folder).mkdir(parents=True, exist_ok=True)
+    
+    try:
+        model = get_whisper_model(model_size)
+        segments, info = model.transcribe(audio_path, language=language, word_level=True)
+        segments = list(segments)  # Convert generator to list for multiple iterations
+        
+        audio_name = Path(audio_path).stem
+        vtt_path = os.path.join(save_folder, f"{audio_name}.vtt")
+        
+        # Generate VTT with word-level timestamps
+        with open(vtt_path, "w", encoding="utf-8") as f:
+            f.write("WEBVTT\n\n")
+            for segment in segments:
+                if segment.words:
+                    for word in segment.words:
+                        start = _ms_to_vtt(word.start)
+                        end = _ms_to_vtt(word.end)
+                        f.write(f"{start} --> {end}\n{word.word.strip()}\n\n")
+                else:
+                    start = _ms_to_vtt(segment.start)
+                    end = _ms_to_vtt(segment.end)
+                    f.write(f"{start} --> {end}\n{segment.text.strip()}\n\n")
+        
+        vtt_size_kb = Path(vtt_path).stat().st_size / 1024
+        audio_size_mb = Path(audio_path).stat().st_size / (1024 * 1024)
+        word_count = sum(len(s.words) if s.words else len(s.text.split()) for s in segments)
+        
+        return jsonify({
+            "status": "success",
+            "audio_path": str(audio_path),
+            "model_size": model_size,
+            "language": info.language,
+            "language_probability": round(info.language_probability, 3),
+            "vtt_path": str(vtt_path),
+            "vtt_size_kb": round(vtt_size_kb, 2),
+            "audio_size_mb": round(audio_size_mb, 2),
+            "duration_sec": round(info.duration, 2),
+            "word_count": word_count,
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+def _ms_to_vtt(seconds):
+    """Convert seconds to VTT timestamp format (HH:MM:SS.mmm)"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
