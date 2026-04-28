@@ -98,7 +98,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up_to=0.3, 
-                 min_score=6, top_n=3, whisper_model="base"):
+                 min_score=6, whisper_model="base"):
     """Run complete pipeline with minimal logging"""
     
     if not Path(video_path).exists():
@@ -117,7 +117,6 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
         "save_folder": str(save_folder),
         "keep_silence_up_to": keep_silence_up_to,
         "min_score": min_score,
-        "top_n": top_n,
         "whisper_model": whisper_model,
     }
     
@@ -240,7 +239,7 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
         candidates = [{"line": e, "score": extract_score(e), "window": w}
                      for e, w in zip(evals, windows) if extract_score(e) >= min_score]
         candidates.sort(key=lambda x: x["score"], reverse=True)
-        top = candidates[:top_n]
+        top = candidates
         
         cand_file = os.path.join(save_folder, f"{video_name}_candidates.txt")
         with open(cand_file, "w", encoding="utf-8") as f:
@@ -342,7 +341,6 @@ def main():
     parser.add_argument("-o", "--output", default="./output", help="Output folder (default: ./output)")
     parser.add_argument("-s", "--silence", type=float, default=0.3, help="Keep silence up to (default: 0.3)")
     parser.add_argument("-m", "--min-score", type=int, default=6, help="Minimum virality score (default: 6)")
-    parser.add_argument("-n", "--top-n", type=int, default=3, help="Number of shorts to generate (default: 3)")
     parser.add_argument("-w", "--whisper", default="base", help="Whisper model size (default: base)")
     parser.add_argument("-j", "--json", action="store_true", help="Output results as JSON")
     
@@ -355,7 +353,6 @@ def main():
             args.output,
             args.silence,
             args.min_score,
-            args.top_n,
             args.whisper
         )
         
