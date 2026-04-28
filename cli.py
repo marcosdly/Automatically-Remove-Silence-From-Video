@@ -2,7 +2,6 @@
 """CLI script for testing the video shorts pipeline"""
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
@@ -55,7 +54,7 @@ def extract_score(evaluation_line):
 
 def vtt_to_ass(vtt_path, save_folder):
     """Convert VTT to ASS format with styling"""
-    ass_path = os.path.join(save_folder, f"{Path(vtt_path).stem}.ass")
+    ass_path = Path(save_folder) / f"{Path(vtt_path).stem}.ass"
     
     with open(vtt_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
@@ -121,66 +120,67 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
     }
     
     video_name = Path(video_path).stem
+    save_folder = Path(save_folder)
     
     try:
         # Step 1: Remove silence
         print("Step 1/7: Removing silence...", end=" ", flush=True)
         t0 = time.time()
-        trimmed = os.path.join(save_folder, f"{video_name}_trimmed.mp4")
+        trimmed = save_folder / f"{video_name}_trimmed.mp4"
         subprocess.run(
-            ["auto-editor", video_path, "-o", trimmed, "--margin", f"{keep_silence_up_to}sec", 
+            ["auto-editor", str(video_path), "-o", str(trimmed), "--margin", f"{keep_silence_up_to}sec", 
              "--no-open", "--video-codec", "h264", "--audio-codec", "aac"],
             capture_output=True, check=True, timeout=600
         )
         # Verify output has video stream; if not, re-encode using ffmpeg
         probe_result = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type",
-             "-of", "default=noprint_wrappers=1:nokey=1", trimmed],
+             "-of", "default=noprint_wrappers=1:nokey=1", str(trimmed)],
             capture_output=True, text=True, timeout=10
         )
         if not probe_result.stdout.strip() or "video" not in probe_result.stdout:
             print("(re-encoding to ensure video stream...)", end=" ", flush=True)
-            trimmed_backup = trimmed.replace(".mp4", "_backup.mp4")
-            os.rename(trimmed, trimmed_backup)
+            trimmed_backup = trimmed.with_stem(f"{trimmed.stem}_backup")
+            trimmed.rename(trimmed_backup)
             subprocess.run(
-                ["ffmpeg", "-i", trimmed_backup, "-c:v", "libx264", "-preset", "ultrafast",
-                 "-c:a", "aac", "-y", trimmed],
+                ["ffmpeg", "-i", str(trimmed_backup), "-c:v", "libx264", "-preset", "ultrafast",
+                 "-c:a", "aac", "-y", str(trimmed)],
                 capture_output=True, check=True, timeout=600
             )
-            os.remove(trimmed_backup)
+            trimmed_backup.unlink()
         step_time = time.time() - t0
-        results["steps"]["remove_silence"] = {"time": round(step_time, 2), "output": trimmed}
+        results["steps"]["remove_silence"] = {"time": round(step_time, 2), "output": str(trimmed)}
         print(f"✓ ({step_time:.1f}s)")
         
         # Step 2: Extract and optimize audio
         print("Step 2/7: Processing audio...", end=" ", flush=True)
         t0 = time.time()
-        audio_raw = os.path.join(save_folder, f"{video_name}_audio.m4a")
-        audio_opt = os.path.join(save_folder, f"{video_name}_audio_opt.m4a")
+        audio_raw = save_folder / f"{video_name}_audio.m4a"
+        audio_opt = save_folder / f"{video_name}_audio_opt.m4a"
         
         # Extract audio with proper stream selection
         subprocess.run(
-            ["ffmpeg", "-i", trimmed, "-q:a", "9", "-vn", "-c:a", "aac", "-y", audio_raw],
+            ["ffmpeg", "-i", str(trimmed), "-q:a", "9", "-vn", "-c:a", "aac", "-y", str(audio_raw)],
             capture_output=True, check=True, timeout=300
         )
         
         # Optimize audio with loudness normalization
         subprocess.run(
-            ["ffmpeg", "-i", audio_raw, "-af", "anlmdn=f=13:t=0.0001,loudnorm",
-             "-ar", "16000", "-ac", "1", "-c:a", "aac", "-q:a", "8", "-y", audio_opt],
+            ["ffmpeg", "-i", str(audio_raw), "-af", "anlmdn=f=13:t=0.0001,loudnorm",
+             "-ar", "16000", "-ac", "1", "-c:a", "aac", "-q:a", "8", "-y", str(audio_opt)],
             capture_output=True, check=True, timeout=300
         )
         step_time = time.time() - t0
-        results["steps"]["audio"] = {"time": round(step_time, 2), "output": audio_opt}
+        results["steps"]["audio"] = {"time": round(step_time, 2), "output": str(audio_opt)}
         print(f"✓ ({step_time:.1f}s)")
         
         # Step 3: Transcribe
         print("Step 3/7: Transcribing...", end=" ", flush=True)
         t0 = time.time()
         model = WhisperModel(whisper_model, device="auto", compute_type="auto")
-        segments, info = model.transcribe(audio_opt, word_level=True)
+        segments, info = model.transcribe(str(audio_opt), word_level=True)
         segments = list(segments)
-        vtt = os.path.join(save_folder, f"{video_name}.vtt")
+        vtt = save_folder / f"{video_name}.vtt"
         with open(vtt, "w", encoding="utf-8") as f:
             f.write("WEBVTT\n\n")
             for seg in segments:
@@ -194,7 +194,7 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
             "time": round(step_time, 2),
             "language": info.language,
             "language_prob": round(info.language_probability, 3),
-            "output": vtt
+            "output": str(vtt)
         }
         print(f"✓ ({step_time:.1f}s)")
         del model
@@ -230,12 +230,12 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
                     windows.append({"duration": dur, "start": t, "end": t + dur, "text": txt})
                 t += 5
         
-        win_file = os.path.join(save_folder, f"{video_name}_windows.txt")
+        win_file = save_folder / f"{video_name}_windows.txt"
         with open(win_file, "w", encoding="utf-8") as f:
             for w in windows:
                 f.write(f"[{w['duration']}s @ {w['start']:.0f}s-{w['end']:.0f}s] {w['text']}\n")
         step_time = time.time() - t0
-        results["steps"]["windows"] = {"time": round(step_time, 2), "count": len(windows), "output": win_file}
+        results["steps"]["windows"] = {"time": round(step_time, 2), "count": len(windows), "output": str(win_file)}
         print(f"✓ ({step_time:.1f}s)")
         
         # Step 5: Evaluate virality
@@ -250,12 +250,12 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
             evals.append(f"[{w['duration']}s @ {w['start']:.0f}s-{w['end']:.0f}s] | {score_text}")
         del llm
         
-        eval_file = os.path.join(save_folder, f"{video_name}_evals.txt")
+        eval_file = save_folder / f"{video_name}_evals.txt"
         with open(eval_file, "w", encoding="utf-8") as f:
             for e in evals:
                 f.write(e + "\n")
         step_time = time.time() - t0
-        results["steps"]["evaluate"] = {"time": round(step_time, 2), "count": len(evals), "output": eval_file}
+        results["steps"]["evaluate"] = {"time": round(step_time, 2), "count": len(evals), "output": str(eval_file)}
         print(f"✓ ({step_time:.1f}s)")
         
         # Step 6: Filter best candidates
@@ -266,7 +266,7 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
         candidates.sort(key=lambda x: x["score"], reverse=True)
         top = candidates
         
-        cand_file = os.path.join(save_folder, f"{video_name}_candidates.txt")
+        cand_file = save_folder / f"{video_name}_candidates.txt"
         with open(cand_file, "w", encoding="utf-8") as f:
             for c in top:
                 f.write(c["line"] + "\n")
@@ -276,7 +276,7 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
             "total_evaluated": len(candidates) + sum(1 for e in evals if extract_score(e) < min_score),
             "selected": len(top),
             "top_scores": [c["score"] for c in top],
-            "output": cand_file
+            "output": str(cand_file)
         }
         print(f"✓ ({step_time:.1f}s)")
         
@@ -287,7 +287,7 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
         
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height", "-of", "csv=p=0", trimmed],
+             "-show_entries", "stream=width,height", "-of", "csv=p=0", str(trimmed)],
             capture_output=True, text=True, timeout=10
         ).stdout.strip()
         vw, vh = map(int, probe.split(','))
@@ -322,22 +322,22 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
             off_y = (out_h - scale_h) // 2
             
             filt = f"[0:v]split=2[bg][main];[bg]scale={out_w}:{out_h},gblur=sigma=50[blurred];[main]scale={scale_w}:{scale_h}[scaled];[blurred][scaled]overlay={off_x}:{off_y}[final]"
-            shorts = os.path.join(save_folder, f"{video_name}_shorts_{idx+1}.mp4")
+            shorts = save_folder / f"{video_name}_shorts_{idx+1}.mp4"
             
             subprocess.run(
-                ["ffmpeg", "-i", trimmed, "-vf", filt, "-vf", f"ass={ass_path}",
+                ["ffmpeg", "-i", str(trimmed), "-vf", filt, "-vf", f"ass={str(ass_path)}",
                  "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                 "-c:a", "aac", "-b:a", "96k", "-y", shorts],
+                 "-c:a", "aac", "-b:a", "96k", "-y", str(shorts)],
                 capture_output=True, check=True, timeout=600
             )
             
-            output_size_mb = Path(shorts).stat().st_size / (1024 * 1024)
+            output_size_mb = shorts.stat().st_size / (1024 * 1024)
             shorts_info.append({
                 "rank": idx + 1,
                 "score": cand["score"],
                 "title": meta["title"],
                 "tags": meta["tags"],
-                "output_path": shorts,
+                "output_path": str(shorts),
                 "size_mb": round(output_size_mb, 2)
             })
         
