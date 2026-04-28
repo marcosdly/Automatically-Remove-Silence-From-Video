@@ -192,5 +192,93 @@ def _ms_to_vtt(seconds):
     secs = seconds % 60
     return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
 
+def _parse_vtt_time(time_str):
+    """Parse VTT timestamp to seconds"""
+    parts = time_str.split(":")
+    return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+
+@app.route("/extract-subtitle-windows", methods=["POST"])
+def extract_subtitle_windows():
+    data = request.json
+    vtt_path = data.get("vtt_path")
+    save_folder = data.get("save_folder", "./output")
+    
+    if not vtt_path or not Path(vtt_path).exists():
+        return jsonify({"error": "Invalid vtt_path"}), 400
+    
+    Path(save_folder).mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # Parse VTT file
+        with open(vtt_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        subtitles = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if " --> " in line:
+                parts = line.split(" --> ")
+                start = _parse_vtt_time(parts[0])
+                end = _parse_vtt_time(parts[1])
+                i += 1
+                text = []
+                while i < len(lines) and lines[i].strip() and " --> " not in lines[i]:
+                    text.append(lines[i].strip())
+                    i += 1
+                subtitles.append({"start": start, "end": end, "text": " ".join(text)})
+            else:
+                i += 1
+        
+        if not subtitles:
+            return jsonify({"error": "No subtitles found in VTT"}), 400
+        
+        # Extract windows: 30s-60s duration in 5s intervals
+        windows = []
+        duration_range = range(30, 65, 5)  # 30, 35, 40, 45, 50, 55, 60
+        max_time = max(s["end"] for s in subtitles)
+        
+        for window_duration in duration_range:
+            start_time = 0
+            while start_time + window_duration <= max_time:
+                window_end = start_time + window_duration
+                window_text = " ".join([
+                    s["text"] for s in subtitles
+                    if s["start"] < window_end and s["end"] > start_time
+                ])
+                if window_text.strip():
+                    windows.append({
+                        "duration": window_duration,
+                        "start": start_time,
+                        "end": window_end,
+                        "text": window_text
+                    })
+                start_time += 5  # 5s interval
+        
+        # Save windows as plain text
+        vtt_name = Path(vtt_path).stem
+        output_path = os.path.join(save_folder, f"{vtt_name}_windows.txt")
+        
+        with open(output_path, "w", encoding="utf-8") as f:
+            for w in windows:
+                f.write(f"[{w['duration']}s @ {w['start']:.0f}s-{w['end']:.0f}s] {w['text']}\n")
+        
+        output_size_kb = Path(output_path).stat().st_size / 1024
+        vtt_size_kb = Path(vtt_path).stat().st_size / 1024
+        
+        return jsonify({
+            "status": "success",
+            "vtt_path": str(vtt_path),
+            "output_path": str(output_path),
+            "window_count": len(windows),
+            "duration_ranges": list(duration_range),
+            "max_subtitle_time_sec": round(max_time, 2),
+            "output_size_kb": round(output_size_kb, 2),
+            "vtt_size_kb": round(vtt_size_kb, 2),
+            "storage_ratio": round(output_size_kb / vtt_size_kb, 2) if vtt_size_kb > 0 else 0,
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
