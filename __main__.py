@@ -1,8 +1,11 @@
 import os
 import subprocess
+import time
+import psutil
 from pathlib import Path
 from flask import Flask, request, jsonify
 from faster_whisper import WhisperModel
+from llama_cpp import Llama
 
 app = Flask(__name__)
 
@@ -196,6 +199,89 @@ def _parse_vtt_time(time_str):
     """Parse VTT timestamp to seconds"""
     parts = time_str.split(":")
     return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+
+@app.route("/evaluate-virality", methods=["POST"])
+def evaluate_virality():
+    data = request.json
+    windows_path = data.get("windows_path")
+    model_path = data.get("model_path")
+    save_folder = data.get("save_folder", "./output")
+    
+    if not windows_path or not Path(windows_path).exists():
+        return jsonify({"error": "Invalid windows_path"}), 400
+    if not model_path or not Path(model_path).exists():
+        return jsonify({"error": "Invalid model_path"}), 400
+    
+    Path(save_folder).mkdir(parents=True, exist_ok=True)
+    start_time = time.time()
+    mem_start = psutil.Process().memory_info().rss / (1024 * 1024)
+    
+    try:
+        # Load model
+        print("Loading model...")
+        model = Llama(model_path=model_path, n_gpu_layers=35, n_ctx=512, verbose=False)
+        
+        # Parse windows file
+        windows = []
+        with open(windows_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    # Extract metadata and text: [30s @ 0s-30s] text...
+                    if "] " in line:
+                        meta, text = line.split("] ", 1)
+                        windows.append({"meta": meta + "]", "text": text})
+        
+        if not windows:
+            return jsonify({"error": "No windows found in file"}), 400
+        
+        # Evaluate each window
+        evaluations = []
+        prompt_template = "Rate the viral potential (1-10) of this video snippet and explain briefly in one sentence:\n\n{text}\n\nVirality Score:"
+        
+        for i, window in enumerate(windows):
+            prompt = prompt_template.format(text=window["text"][:200])  # Truncate for speed
+            output = model(prompt, max_tokens=50, temperature=0.3, stop=["Score:", "\n"])
+            score_text = output["choices"][0]["text"].strip()
+            evaluations.append(f"{window['meta']} | {score_text}")
+            
+            if (i + 1) % 10 == 0:
+                print(f"Evaluated {i + 1}/{len(windows)} windows")
+        
+        # Save evaluations
+        windows_name = Path(windows_path).stem
+        output_path = os.path.join(save_folder, f"{windows_name}_evaluations.txt")
+        
+        with open(output_path, "w", encoding="utf-8") as f:
+            for eval_line in evaluations:
+                f.write(eval_line + "\n")
+        
+        # Unload model
+        del model
+        
+        # Calculate metrics
+        end_time = time.time()
+        mem_end = psutil.Process().memory_info().rss / (1024 * 1024)
+        total_time = end_time - start_time
+        
+        output_size_kb = Path(output_path).stat().st_size / 1024
+        windows_size_kb = Path(windows_path).stat().st_size / 1024
+        
+        return jsonify({
+            "status": "success",
+            "windows_path": str(windows_path),
+            "model_path": str(model_path),
+            "output_path": str(output_path),
+            "windows_evaluated": len(evaluations),
+            "output_size_kb": round(output_size_kb, 2),
+            "windows_size_kb": round(windows_size_kb, 2),
+            "total_time_sec": round(total_time, 2),
+            "time_per_window_ms": round((total_time / len(evaluations) * 1000), 2) if evaluations else 0,
+            "memory_peak_mb": round(max(mem_start, mem_end), 2),
+            "memory_delta_mb": round(mem_end - mem_start, 2),
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/extract-subtitle-windows", methods=["POST"])
 def extract_subtitle_windows():
