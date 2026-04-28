@@ -2,6 +2,8 @@ import os
 import subprocess
 import time
 import psutil
+import json
+import re
 from pathlib import Path
 from flask import Flask, request, jsonify
 from faster_whisper import WhisperModel
@@ -215,6 +217,51 @@ def _extract_score(evaluation_line):
         pass
     return 0
 
+def _vtt_to_ass(vtt_path, save_folder):
+    """Convert VTT with word-level timing to ASS format with styling"""
+    ass_path = os.path.join(save_folder, f"{Path(vtt_path).stem}.ass")
+    
+    with open(vtt_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    
+    subtitles = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if " --> " in line and not line.startswith("WEBVTT"):
+            parts = line.split(" --> ")
+            start = parts[0].strip()
+            end = parts[1].strip()
+            i += 1
+            text = []
+            while i < len(lines) and lines[i].strip() and " --> " not in lines[i]:
+                text.append(lines[i].strip())
+                i += 1
+            subtitles.append({"start": start, "end": end, "text": " ".join(text)})
+        else:
+            i += 1
+    
+    # Create ASS file with styling
+    ass_header = """[Script Info]
+Title: Shorts
+ScriptType: v4.00+
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,60,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,2,1,2,0,0,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(ass_header)
+        for sub in subtitles:
+            text = sub["text"].replace('"', '\\"')
+            f.write(f"Dialogue: 0,{sub['start']},{sub['end']},Default,,0,0,0,,{text}\n")
+    
+    return ass_path
+
 @app.route("/filter-best-candidates", methods=["POST"])
 def filter_best_candidates():
     data = request.json
@@ -268,6 +315,99 @@ def filter_best_candidates():
             "output_path": str(output_path),
             "output_size_kb": round(output_size_kb, 2),
         }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/render-shorts", methods=["POST"])
+def render_shorts():
+    data = request.json
+    video_path = data.get("video_path")
+    vtt_path = data.get("vtt_path")
+    title = data.get("title", "")
+    save_folder = data.get("save_folder", "./output")
+    output_width = data.get("output_width", 1080)
+    output_height = data.get("output_height", 1920)
+    blur_sigma = data.get("blur_sigma", 50)
+    
+    if not video_path or not Path(video_path).exists():
+        return jsonify({"error": "Invalid video_path"}), 400
+    if not vtt_path or not Path(vtt_path).exists():
+        return jsonify({"error": "Invalid vtt_path"}), 400
+    
+    Path(save_folder).mkdir(parents=True, exist_ok=True)
+    start_time = time.time()
+    
+    try:
+        # Get video dimensions
+        probe_cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=width,height,duration", 
+                     "-of", "csv=p=0", video_path]
+        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True).stdout.strip()
+        vw, vh, duration = map(float, probe_result.split(','))
+        vw, vh = int(vw), int(vh)
+        
+        # Calculate scale to fit video without distortion
+        target_ratio = output_width / output_height
+        video_ratio = vw / vh
+        
+        if video_ratio > target_ratio:  # Landscape wider than 4:3
+            scale_w = int(output_height * video_ratio)
+            scale_h = output_height
+        else:
+            scale_w = output_width
+            scale_h = int(output_width / video_ratio)
+        
+        offset_x = (output_width - scale_w) // 2
+        offset_y = (output_height - scale_h) // 2
+        
+        # Convert VTT to ASS with styled subtitles
+        ass_path = _vtt_to_ass(vtt_path, save_folder)
+        
+        # FFmpeg complex filter: split video, blur one copy as background, overlay main on top, add subtitles
+        combined_filter = (
+            f"[0:v]split=2[bg][main];"
+            f"[bg]scale={output_width}:{output_height},gblur=sigma={blur_sigma}[blurred];"
+            f"[main]scale={scale_w}:{scale_h}[scaled];"
+            f"[blurred][scaled]overlay={offset_x}:{offset_y}[final]"
+        )
+        
+        output_path = os.path.join(save_folder, f"{Path(video_path).stem}_shorts.mp4")
+        
+        cmd = [
+            "ffmpeg", "-i", video_path,
+            "-vf", combined_filter,
+            "-vf", f"ass={ass_path}",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "96k",
+            "-y", output_path
+        ]
+        
+        subprocess.run(cmd, capture_output=True, check=True, timeout=600)
+        
+        end_time = time.time()
+        output_size_mb = Path(output_path).stat().st_size / (1024 * 1024)
+        
+        return jsonify({
+            "status": "success",
+            "video_path": str(video_path),
+            "vtt_path": str(vtt_path),
+            "title": title,
+            "output_width": output_width,
+            "output_height": output_height,
+            "blur_sigma": blur_sigma,
+            "input_video_width": vw,
+            "input_video_height": vh,
+            "scaled_width": scale_w,
+            "scaled_height": scale_h,
+            "offset_x": offset_x,
+            "offset_y": offset_y,
+            "output_path": str(output_path),
+            "output_size_mb": round(output_size_mb, 2),
+            "duration_sec": round(duration, 2),
+            "processing_time_sec": round(end_time - start_time, 2),
+        }), 200
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Processing timeout"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
