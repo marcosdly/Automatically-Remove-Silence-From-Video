@@ -75,6 +75,62 @@ def remove_silence():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/optimize-audio", methods=["POST"])
+def optimize_audio():
+    data = request.json
+    input_path = data.get("input_path")
+    save_folder = data.get("save_folder", "./output")
+    
+    if not input_path or not Path(input_path).exists():
+        return jsonify({"error": "Invalid input_path"}), 400
+    
+    Path(save_folder).mkdir(parents=True, exist_ok=True)
+    
+    try:
+        input_name = Path(input_path).stem
+        output_path = os.path.join(save_folder, f"{input_name}_optimized.m4a")
+        
+        # Get input duration and original size
+        input_duration = get_duration(input_path)
+        input_size_mb = Path(input_path).stat().st_size / (1024 * 1024)
+        
+        # FFmpeg filters for transcription optimization:
+        # - anlmdn: Noise reduction (Adaptive Noise Reduction)
+        # - loudnorm: Normalize audio levels for consistency
+        # - resample to 16kHz mono (optimal for Whisper)
+        cmd = [
+            "ffmpeg", "-i", input_path,
+            "-af", "anlmdn=f=13:t=0.0001,loudnorm",
+            "-ar", "16000", "-ac", "1",
+            "-c:a", "aac", "-q:a", "8",
+            "-y", output_path
+        ]
+        
+        subprocess.run(cmd, capture_output=True, check=True)
+        
+        output_size_mb = Path(output_path).stat().st_size / (1024 * 1024)
+        
+        return jsonify({
+            "status": "success",
+            "input_path": str(input_path),
+            "output_path": str(output_path),
+            "input_duration_sec": round(input_duration, 2) if input_duration else None,
+            "input_size_mb": round(input_size_mb, 2),
+            "output_size_mb": round(output_size_mb, 2),
+            "compression_ratio": round(input_size_mb / output_size_mb, 2) if output_size_mb > 0 else 0,
+            "storage_saved_mb": round(input_size_mb - output_size_mb, 2),
+            "optimizations_applied": [
+                "Noise reduction (adaptive)",
+                "Level normalization",
+                "16kHz mono (Whisper optimized)",
+                "AAC encoding (efficient)"
+            ]
+        }), 200
+    except subprocess.CalledProcessError:
+        return jsonify({"error": "ffmpeg processing failed"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
     data = request.json
