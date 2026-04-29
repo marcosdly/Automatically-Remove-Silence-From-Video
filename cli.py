@@ -156,18 +156,19 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
         print("Step 2/7: Processing audio...", end=" ", flush=True)
         t0 = time.time()
         audio_raw = save_folder / f"{video_name}_audio.m4a"
-        audio_opt = save_folder / f"{video_name}_audio_opt.m4a"
+        audio_opt = save_folder / f"{video_name}_audio_opt.wav"
         
         # Extract audio with proper stream selection
         subprocess.run(
-            ["ffmpeg", "-i", str(trimmed), "-q:a", "9", "-vn", "-c:a", "aac", "-y", str(audio_raw)],
+            ["ffmpeg", "-i", str(trimmed), "-vn", "-c:a", "alac", "-y", str(audio_raw)],
             capture_output=True, check=True, timeout=300
         )
         
         # Optimize audio with loudness normalization
         subprocess.run(
-            ["ffmpeg", "-i", str(audio_raw), "-af", "anlmdn=f=13:t=0.0001,loudnorm",
-             "-ar", "16000", "-ac", "1", "-c:a", "aac", "-q:a", "8", "-y", str(audio_opt)],
+            ["ffmpeg", "-i", str(trimmed),
+             "-af", "highpass=f=80,lowpass=f=7600,afftdn=nf=-25,acompressor=threshold=-18dB:ratio=3:attack=5:release=50,volume=3dB,loudnorm=I=-16:TP=-1.5:LRA=7",
+             "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", "-y", str(audio_opt)],
             capture_output=True, check=True, timeout=300
         )
         step_time = time.time() - t0
@@ -178,7 +179,7 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
         print("Step 3/7: Transcribing...", end=" ", flush=True)
         t0 = time.time()
         model = WhisperModel(whisper_model, device="auto", compute_type="auto")
-        segments, info = model.transcribe(str(audio_opt), word_level=True)
+        segments, info = model.transcribe(str(audio_opt), word_timestamps=True)
         segments = list(segments)
         vtt = save_folder / f"{video_name}.vtt"
         with open(vtt, "w", encoding="utf-8") as f:
