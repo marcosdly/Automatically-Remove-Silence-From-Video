@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """CLI script for testing the video shorts pipeline"""
 import argparse
+import hashlib
 import json
+import logging
 import re
 import subprocess
 import sys
@@ -10,6 +12,65 @@ from pathlib import Path
 
 from faster_whisper import WhisperModel
 from llama_cpp import Llama
+from tqdm import tqdm
+
+
+# Setup logging
+def setup_logging(log_file):
+    """Configure logging to file and console"""
+    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    
+    # File handler
+    fh = logging.FileHandler(log_file)
+    fh.setLevel(logging.DEBUG)
+    
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    
+    # Formatter
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+    
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    
+    return logger
+
+
+def generate_cache_key(video_path, model_path, keep_silence_up_to, min_score, whisper_model):
+    """Generate a unique cache key based on input parameters"""
+    params_str = f"{video_path}|{model_path}|{keep_silence_up_to}|{min_score}|{whisper_model}"
+    return hashlib.md5(params_str.encode()).hexdigest()
+
+
+def get_cache_path(save_folder, cache_key):
+    """Get path to cache file for given cache key"""
+    return Path(save_folder) / ".cache" / f"{cache_key}.json"
+
+
+def load_cache(cache_path):
+    """Load results from cache if it exists"""
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Failed to load cache from {cache_path}: {e}")
+    return None
+
+
+def save_cache(cache_path, results):
+    """Save results to cache"""
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
+    except Exception as e:
+        logging.warning(f"Failed to save cache to {cache_path}: {e}")
 
 
 def get_duration(video_path):
@@ -97,7 +158,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up_to=0.3, 
-                 min_score=6, whisper_model="base"):
+                 min_score=6, whisper_model="base", force=False):
     """Run complete pipeline with minimal logging"""
     
     if not Path(video_path).exists():
@@ -106,6 +167,29 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
         raise FileNotFoundError(f"Model not found: {model_path}")
     
     Path(save_folder).mkdir(parents=True, exist_ok=True)
+    
+    # Setup logging
+    log_file = Path(save_folder) / "pipeline.log"
+    logger = setup_logging(str(log_file))
+    
+    logger.info("="*60)
+    logger.info("Starting video shorts pipeline")
+    logger.info("="*60)
+    logger.info(f"Video: {video_path}")
+    logger.info(f"Model: {model_path}")
+    logger.info(f"Output: {save_folder}")
+    logger.info(f"Parameters: silence_up_to={keep_silence_up_to}, min_score={min_score}, whisper={whisper_model}")
+    
+    # Check cache
+    cache_key = generate_cache_key(video_path, model_path, keep_silence_up_to, min_score, whisper_model)
+    cache_path = get_cache_path(save_folder, cache_key)
+    
+    if not force:
+        cached_results = load_cache(cache_path)
+        if cached_results:
+            logger.info(f"✓ Using cached results from {cache_path}")
+            return cached_results
+    
     pipeline_start = time.time()
     results = {"steps": {}, "outputs": {}, "params": {}}
     
@@ -125,6 +209,7 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
     try:
         # Step 1: Remove silence
         print("Step 1/7: Removing silence...", end=" ", flush=True)
+        logger.info("Step 1/7: Removing silence...")
         t0 = time.time()
         trimmed = save_folder / f"{video_name}_trimmed.mp4"
         subprocess.run(
@@ -140,6 +225,7 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
         )
         if not probe_result.stdout.strip() or "video" not in probe_result.stdout:
             print("(re-encoding to ensure video stream...)", end=" ", flush=True)
+            logger.info("Re-encoding trimmed video to ensure video stream...")
             trimmed_backup = trimmed.with_stem(f"{trimmed.stem}_backup")
             trimmed.rename(trimmed_backup)
             subprocess.run(
@@ -150,10 +236,12 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
             trimmed_backup.unlink()
         step_time = time.time() - t0
         results["steps"]["remove_silence"] = {"time": round(step_time, 2), "output": str(trimmed)}
+        logger.info(f"✓ Step 1 completed in {step_time:.1f}s")
         print(f"✓ ({step_time:.1f}s)")
         
         # Step 2: Extract and optimize audio
         print("Step 2/7: Processing audio...", end=" ", flush=True)
+        logger.info("Step 2/7: Processing audio...")
         t0 = time.time()
         audio_raw = save_folder / f"{video_name}_audio.m4a"
         audio_opt = save_folder / f"{video_name}_audio_opt.wav"
@@ -173,14 +261,17 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
         )
         step_time = time.time() - t0
         results["steps"]["audio"] = {"time": round(step_time, 2), "output": str(audio_opt)}
+        logger.info(f"✓ Step 2 completed in {step_time:.1f}s")
         print(f"✓ ({step_time:.1f}s)")
         
         # Step 3: Transcribe
         print("Step 3/7: Transcribing...", end=" ", flush=True)
+        logger.info("Step 3/7: Transcribing audio...")
         t0 = time.time()
         model = WhisperModel(whisper_model, device="auto", compute_type="auto")
         segments, info = model.transcribe(str(audio_opt), word_timestamps=True)
         segments = list(segments)
+        logger.info(f"Detected language: {info.language} (confidence: {info.language_probability:.3f})")
         vtt = save_folder / f"{video_name}.vtt"
         with open(vtt, "w", encoding="utf-8") as f:
             f.write("WEBVTT\n\n")
@@ -197,11 +288,13 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
             "language_prob": round(info.language_probability, 3),
             "output": str(vtt)
         }
+        logger.info(f"✓ Step 3 completed in {step_time:.1f}s - Generated {len(segments)} segments")
         print(f"✓ ({step_time:.1f}s)")
         del model
         
         # Step 4: Extract subtitle windows
         print("Step 4/7: Extracting windows...", end=" ", flush=True)
+        logger.info("Step 4/7: Extracting subtitle windows...")
         t0 = time.time()
         with open(vtt, "r", encoding="utf-8") as f:
             lines = f.readlines()
@@ -237,19 +330,22 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
                 f.write(f"[{w['duration']}s @ {w['start']:.0f}s-{w['end']:.0f}s] {w['text']}\n")
         step_time = time.time() - t0
         results["steps"]["windows"] = {"time": round(step_time, 2), "count": len(windows), "output": str(win_file)}
+        logger.info(f"✓ Step 4 completed in {step_time:.1f}s - Generated {len(windows)} windows from {len(subtitles)} subtitles")
         print(f"✓ ({step_time:.1f}s)")
         
         # Step 5: Evaluate virality
         print("Step 5/7: Evaluating virality...", end=" ", flush=True)
+        logger.info("Step 5/7: Evaluating virality using LLM...")
         t0 = time.time()
         llm = Llama(model_path=model_path, n_gpu_layers=35, n_ctx=512, verbose=False)
         evals = []
-        for i, w in enumerate(windows):
+        for i, w in enumerate(tqdm(windows, desc="Evaluating", unit="window", leave=False)):
             p = f"Rate the viral potential (1-10) of this video snippet and explain briefly in one sentence:\n\n{w['text'][:200]}\n\nVirality Score:"
             out = llm(p, max_tokens=50, temperature=0.3, stop=["Score:", "\n"])
             score_text = out["choices"][0]["text"].strip()
             evals.append(f"[{w['duration']}s @ {w['start']:.0f}s-{w['end']:.0f}s] | {score_text}")
         del llm
+        logger.info(f"Evaluated {len(evals)} windows")
         
         eval_file = save_folder / f"{video_name}_evals.txt"
         with open(eval_file, "w", encoding="utf-8") as f:
@@ -257,15 +353,19 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
                 f.write(e + "\n")
         step_time = time.time() - t0
         results["steps"]["evaluate"] = {"time": round(step_time, 2), "count": len(evals), "output": str(eval_file)}
+        logger.info(f"✓ Step 5 completed in {step_time:.1f}s")
         print(f"✓ ({step_time:.1f}s)")
         
         # Step 6: Filter best candidates
         print("Step 6/7: Filtering candidates...", end=" ", flush=True)
+        logger.info("Step 6/7: Filtering candidates...")
         t0 = time.time()
         candidates = [{"line": e, "score": extract_score(e), "window": w}
                      for e, w in zip(evals, windows) if extract_score(e) >= min_score]
         candidates.sort(key=lambda x: x["score"], reverse=True)
         top = candidates
+        logger.info(f"Filtered {len(top)} candidates with score >= {min_score}")
+        logger.debug(f"Top scores: {[c['score'] for c in top]}")
         
         cand_file = save_folder / f"{video_name}_candidates.txt"
         with open(cand_file, "w", encoding="utf-8") as f:
@@ -279,10 +379,12 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
             "top_scores": [c["score"] for c in top],
             "output": str(cand_file)
         }
+        logger.info(f"✓ Step 6 completed in {step_time:.1f}s")
         print(f"✓ ({step_time:.1f}s)")
         
         # Step 7: Render shorts
         print("Step 7/7: Rendering shorts...", end=" ", flush=True)
+        logger.info(f"Step 7/7: Rendering {len(top)} shorts...")
         t0 = time.time()
         llm = Llama(model_path=model_path, n_gpu_layers=35, n_ctx=512, verbose=False)
         
@@ -296,7 +398,8 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
         ass_path = vtt_to_ass(vtt, save_folder)
         shorts_info = []
         
-        for idx, cand in enumerate(top):
+        for idx, cand in enumerate(tqdm(top, desc="Rendering", unit="short", leave=False)):
+            logger.debug(f"Rendering short {idx+1}/{len(top)}: score {cand['score']}")
             # Generate metadata
             p = f"Analyze this video content snippet and provide metadata in this exact format:\nTAGS: tag1, tag2, tag3\nKEYWORDS: keyword1, keyword2, keyword3, keyword4\nTITLE: short title\nDESCRIPTION: 1-2 sentence description\n\nContent: {cand['window']['text'][:300]}\n\n"
             out = llm(p, max_tokens=100, temperature=0.3, stop=["Content:"])
@@ -341,22 +444,36 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
                 "output_path": str(shorts),
                 "size_mb": round(output_size_mb, 2)
             })
+            logger.debug(f"✓ Short {idx+1} rendered: {shorts.name} ({output_size_mb:.2f}MB)")
         
         del llm
         results["outputs"]["shorts"] = shorts_info
         step_time = time.time() - t0
         results["steps"]["render"] = {"time": round(step_time, 2), "count": len(shorts_info)}
+        logger.info(f"✓ Step 7 completed in {step_time:.1f}s - Generated {len(shorts_info)} shorts")
         print(f"✓ ({step_time:.1f}s)")
         
         # Summary
         results["total_time_sec"] = round(time.time() - pipeline_start, 2)
         results["status"] = "success"
         
+        logger.info("="*60)
+        logger.info("Pipeline completed successfully!")
+        logger.info(f"Total time: {results['total_time_sec']}s")
+        logger.info(f"Shorts generated: {len(shorts_info)}")
+        logger.info(f"Cache saved to: {cache_path}")
+        logger.info("="*60)
+        
+        # Save cache
+        save_cache(cache_path, results)
+        
         return results
         
     except Exception as e:
         results["status"] = "error"
         results["error"] = str(e)
+        logger.error(f"Pipeline failed with error: {e}", exc_info=True)
+        logger.error("="*60)
         return results
 
 
@@ -368,6 +485,7 @@ def main():
     parser.add_argument("-s", "--silence", type=float, default=0.3, help="Keep silence up to (default: 0.3)")
     parser.add_argument("-m", "--min-score", type=int, default=6, help="Minimum virality score (default: 6)")
     parser.add_argument("-w", "--whisper", default="base", help="Whisper model size (default: base)")
+    parser.add_argument("--force", action="store_true", help="Skip cache and reprocess (default: use cache)")
     parser.add_argument("-j", "--json", action="store_true", help="Output results as JSON")
     
     args = parser.parse_args()
@@ -379,7 +497,8 @@ def main():
             args.output,
             args.silence,
             args.min_score,
-            args.whisper
+            args.whisper,
+            force=args.force
         )
         
         if args.json:
@@ -391,16 +510,16 @@ def main():
             print("="*60)
             
             if results["status"] == "success":
-                print("\n📋 PARAMETERS:")
+                print(f"\n📋 PARAMETERS:")
                 for k, v in results["params"].items():
                     print(f"  {k}: {v}")
                 
-                print("\n⏱️  TIMING:")
+                print(f"\n⏱️  TIMING:")
                 for step, data in results["steps"].items():
                     print(f"  {step}: {data.get('time', 'N/A')}s")
                 print(f"  TOTAL: {results['total_time_sec']}s")
                 
-                print("\n📊 RESULTS:")
+                print(f"\n📊 RESULTS:")
                 for k, v in results["steps"].items():
                     if k == "filter":
                         print(f"  {k}:")
@@ -416,12 +535,19 @@ def main():
                     elif k == "render":
                         print(f"  {k}: {v.get('count')} shorts")
                 
-                print("\n🎬 SHORTS GENERATED:")
+                print(f"\n🎬 SHORTS GENERATED:")
                 for short in results["outputs"].get("shorts", []):
                     print(f"  #{short['rank']}: {short['title']} (score: {short['score']}, {short['size_mb']}MB)")
                     print(f"      → {short['output_path']}")
+                
+                cache_key = generate_cache_key(args.video_path, args.model_path, args.silence, args.min_score, args.whisper)
+                cache_path = get_cache_path(args.output, cache_key)
+                print(f"\n💾 CACHE: {cache_path}")
+                print(f"📄 LOG: {Path(args.output) / 'pipeline.log'}")
+                print(f"Run with --force to skip cache and reprocess")
             else:
                 print(f"\n❌ ERROR: {results.get('error')}")
+                print(f"📄 LOG: {Path(args.output) / 'pipeline.log'}")
             
             print("\n" + "="*60)
     
