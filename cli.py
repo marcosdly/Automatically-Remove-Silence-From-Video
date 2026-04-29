@@ -10,11 +10,13 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from xmlrpc import client
 
-import google.generativeai as genai
+import google.genai as genai
 from faster_whisper import WhisperModel
 from tqdm import tqdm
 
+genai_client:genai.Client=None
 
 # Setup logging
 def setup_logging(log_file):
@@ -186,7 +188,7 @@ def run_pipeline(video_path, model_path=None, save_folder="./output", keep_silen
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
             raise ValueError("GOOGLE_API_KEY environment variable not set")
-        genai.configure(api_key=api_key)
+        genai_client = genai.Client(api_key=api_key)
     
     Path(save_folder).mkdir(parents=True, exist_ok=True)
     
@@ -362,7 +364,7 @@ def run_pipeline(video_path, model_path=None, save_folder="./output", keep_silen
         t0 = time.time()
         
         if use_gemini:
-            model = genai.GenerativeModel("gemini-2.0-flash")
+            model = "gemini-3-flash-preview"
         else:
             from llama_cpp import Llama
             model = Llama(model_path=model_path, n_gpu_layers=35, n_ctx=512, verbose=False)
@@ -372,14 +374,12 @@ def run_pipeline(video_path, model_path=None, save_folder="./output", keep_silen
             prompt = f"Rate the viral potential (1-10) of this video snippet and explain briefly in one sentence:\n\n{w['text'][:200]}\n\nVirality Score: "
             
             if use_gemini:
-                response = model.generate_content(
-                    prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        max_output_tokens=50,
-                        temperature=0.3,
-                    )
-                )
-                score_text = response.text.strip()
+                response = genai_client.models.generate_content(model=model, contents=prompt, config={
+                    "temperature": 0.3,
+                    "max_output_tokens": 50,
+                })
+                
+                score_text = (response.text or "").strip()
             else:
                 out = model(prompt, max_tokens=50, temperature=0.3, stop=["Score:", "\n"])
                 score_text = out["choices"][0]["text"].strip()
@@ -430,7 +430,7 @@ def run_pipeline(video_path, model_path=None, save_folder="./output", keep_silen
         t0 = time.time()
         
         if use_gemini:
-            model = genai.GenerativeModel("gemini-2.0-flash")
+            model = "gemini-3-flash-preview"
         else:
             from llama_cpp import Llama
             model = Llama(model_path=model_path, n_gpu_layers=35, n_ctx=512, verbose=False)
@@ -451,14 +451,11 @@ def run_pipeline(video_path, model_path=None, save_folder="./output", keep_silen
             prompt = f"Analyze this video content snippet and provide metadata in this exact format:\nTAGS: tag1, tag2, tag3\nKEYWORDS: keyword1, keyword2, keyword3, keyword4\nTITLE: short title\nDESCRIPTION: 1-2 sentence description\n\nContent: {cand['window']['text'][:300]}\n\nProvide ONLY the metadata in the specified format."
             
             if use_gemini:
-                response = model.generate_content(
-                    prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        max_output_tokens=100,
-                        temperature=0.3,
-                    )
-                )
-                resp = response.text.strip()
+                response = genai_client.models.generate_content(model=model, contents=prompt, config={
+                    "temperature": 0.3,
+                    "max_output_tokens": 100,
+                })
+                resp = (response.text or "").strip()
             else:
                 out = model(prompt, max_tokens=100, temperature=0.3, stop=["Content:"])
                 resp = out["choices"][0]["text"].strip()
