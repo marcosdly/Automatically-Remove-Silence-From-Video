@@ -4,14 +4,15 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+import google.generativeai as genai
 from faster_whisper import WhisperModel
-from llama_cpp import Llama
 from tqdm import tqdm
 
 
@@ -157,14 +158,35 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return ass_path
 
 
-def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up_to=0.3, 
-                 min_score=6, whisper_model="base", force=False):
-    """Run complete pipeline with minimal logging"""
+def run_pipeline(video_path, model_path=None, save_folder="./output", keep_silence_up_to=0.3, 
+                 min_score=6, whisper_model="base", force=False, use_gemini=True):
+    """Run complete pipeline with minimal logging
+    
+    Args:
+        video_path: Path to input video
+        model_path: Path to LLM model (optional if using Gemini)
+        save_folder: Output folder
+        keep_silence_up_to: Silence threshold in seconds
+        min_score: Minimum virality score threshold
+        whisper_model: Whisper model size
+        force: Skip cache and reprocess
+        use_gemini: Use Google Gemini API for evaluation (default: True)
+    """
     
     if not Path(video_path).exists():
         raise FileNotFoundError(f"Video not found: {video_path}")
-    if not Path(model_path).exists():
+    
+    if not use_gemini and not model_path:
+        raise ValueError("model_path required when use_gemini=False")
+    
+    if not use_gemini and not Path(model_path).exists():
         raise FileNotFoundError(f"Model not found: {model_path}")
+    
+    if use_gemini:
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise ValueError("GOOGLE_API_KEY environment variable not set")
+        genai.configure(api_key=api_key)
     
     Path(save_folder).mkdir(parents=True, exist_ok=True)
     
@@ -176,12 +198,13 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
     logger.info("Starting video shorts pipeline")
     logger.info("="*60)
     logger.info(f"Video: {video_path}")
-    logger.info(f"Model: {model_path}")
+    logger.info(f"Model: {'Google Gemini API' if use_gemini else model_path}")
     logger.info(f"Output: {save_folder}")
     logger.info(f"Parameters: silence_up_to={keep_silence_up_to}, min_score={min_score}, whisper={whisper_model}")
     
     # Check cache
-    cache_key = generate_cache_key(video_path, model_path, keep_silence_up_to, min_score, whisper_model)
+    model_identifier = "gemini" if use_gemini else model_path
+    cache_key = generate_cache_key(video_path, model_identifier, keep_silence_up_to, min_score, whisper_model)
     cache_path = get_cache_path(save_folder, cache_key)
     
     if not force:
@@ -335,17 +358,36 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
         
         # Step 5: Evaluate virality
         print("Step 5/7: Evaluating virality...", end=" ", flush=True)
-        logger.info("Step 5/7: Evaluating virality using LLM...")
+        logger.info(f"Step 5/7: Evaluating virality using {'Google Gemini API' if use_gemini else 'LLM'}...")
         t0 = time.time()
-        llm = Llama(model_path=model_path, n_gpu_layers=35, n_ctx=512, verbose=False)
+        
+        if use_gemini:
+            model = genai.GenerativeModel("gemini-2.0-flash")
+        else:
+            from llama_cpp import Llama
+            model = Llama(model_path=model_path, n_gpu_layers=35, n_ctx=512, verbose=False)
+        
         evals = []
         for i, w in enumerate(tqdm(windows, desc="Evaluating", unit="window", leave=False)):
-            p = f"Rate the viral potential (1-10) of this video snippet and explain briefly in one sentence:\n\n{w['text'][:200]}\n\nVirality Score:"
-            out = llm(p, max_tokens=50, temperature=0.3, stop=["Score:", "\n"])
-            score_text = out["choices"][0]["text"].strip()
+            prompt = f"Rate the viral potential (1-10) of this video snippet and explain briefly in one sentence:\n\n{w['text'][:200]}\n\nVirality Score: "
+            
+            if use_gemini:
+                response = model.generate_content(
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        max_output_tokens=50,
+                        temperature=0.3,
+                    )
+                )
+                score_text = response.text.strip()
+            else:
+                out = model(prompt, max_tokens=50, temperature=0.3, stop=["Score:", "\n"])
+                score_text = out["choices"][0]["text"].strip()
+            
             evals.append(f"[{w['duration']}s @ {w['start']:.0f}s-{w['end']:.0f}s] | {score_text}")
-        del llm
-        logger.info(f"Evaluated {len(evals)} windows")
+        
+        del model
+        logger.info(f"Evaluated {len(evals)} windows using {'Gemini' if use_gemini else 'LLM'}")
         
         eval_file = save_folder / f"{video_name}_evals.txt"
         with open(eval_file, "w", encoding="utf-8") as f:
@@ -384,9 +426,14 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
         
         # Step 7: Render shorts
         print("Step 7/7: Rendering shorts...", end=" ", flush=True)
-        logger.info(f"Step 7/7: Rendering {len(top)} shorts...")
+        logger.info(f"Step 7/7: Rendering {len(top)} shorts using metadata generation...")
         t0 = time.time()
-        llm = Llama(model_path=model_path, n_gpu_layers=35, n_ctx=512, verbose=False)
+        
+        if use_gemini:
+            model = genai.GenerativeModel("gemini-2.0-flash")
+        else:
+            from llama_cpp import Llama
+            model = Llama(model_path=model_path, n_gpu_layers=35, n_ctx=512, verbose=False)
         
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -401,9 +448,20 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
         for idx, cand in enumerate(tqdm(top, desc="Rendering", unit="short", leave=False)):
             logger.debug(f"Rendering short {idx+1}/{len(top)}: score {cand['score']}")
             # Generate metadata
-            p = f"Analyze this video content snippet and provide metadata in this exact format:\nTAGS: tag1, tag2, tag3\nKEYWORDS: keyword1, keyword2, keyword3, keyword4\nTITLE: short title\nDESCRIPTION: 1-2 sentence description\n\nContent: {cand['window']['text'][:300]}\n\n"
-            out = llm(p, max_tokens=100, temperature=0.3, stop=["Content:"])
-            resp = out["choices"][0]["text"].strip()
+            prompt = f"Analyze this video content snippet and provide metadata in this exact format:\nTAGS: tag1, tag2, tag3\nKEYWORDS: keyword1, keyword2, keyword3, keyword4\nTITLE: short title\nDESCRIPTION: 1-2 sentence description\n\nContent: {cand['window']['text'][:300]}\n\nProvide ONLY the metadata in the specified format."
+            
+            if use_gemini:
+                response = model.generate_content(
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        max_output_tokens=100,
+                        temperature=0.3,
+                    )
+                )
+                resp = response.text.strip()
+            else:
+                out = model(prompt, max_tokens=100, temperature=0.3, stop=["Content:"])
+                resp = out["choices"][0]["text"].strip()
             
             meta = {"tags": [], "keywords": [], "title": "", "description": ""}
             for line in resp.split("\n"):
@@ -446,7 +504,7 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
             })
             logger.debug(f"✓ Short {idx+1} rendered: {shorts.name} ({output_size_mb:.2f}MB)")
         
-        del llm
+        del model
         results["outputs"]["shorts"] = shorts_info
         step_time = time.time() - t0
         results["steps"]["render"] = {"time": round(step_time, 2), "count": len(shorts_info)}
@@ -480,15 +538,20 @@ def run_pipeline(video_path, model_path, save_folder="./output", keep_silence_up
 def main():
     parser = argparse.ArgumentParser(description="Video shorts pipeline CLI")
     parser.add_argument("video_path", help="Path to input video")
-    parser.add_argument("model_path", help="Path to LLM model")
+    parser.add_argument("model_path", nargs="?", default=None, help="Path to LLM model (optional if using Gemini)")
     parser.add_argument("-o", "--output", default="./output", help="Output folder (default: ./output)")
     parser.add_argument("-s", "--silence", type=float, default=0.3, help="Keep silence up to (default: 0.3)")
     parser.add_argument("-m", "--min-score", type=int, default=6, help="Minimum virality score (default: 6)")
     parser.add_argument("-w", "--whisper", default="base", help="Whisper model size (default: base)")
     parser.add_argument("--force", action="store_true", help="Skip cache and reprocess (default: use cache)")
+    parser.add_argument("--use-gemini", action="store_true", default=True, help="Use Google Gemini API (default: True)")
+    parser.add_argument("--use-local-llm", action="store_true", help="Use local LLM instead of Gemini")
     parser.add_argument("-j", "--json", action="store_true", help="Output results as JSON")
     
     args = parser.parse_args()
+    
+    # Determine whether to use Gemini or local LLM
+    use_gemini = not args.use_local_llm
     
     try:
         results = run_pipeline(
@@ -498,7 +561,8 @@ def main():
             args.silence,
             args.min_score,
             args.whisper,
-            force=args.force
+            force=args.force,
+            use_gemini=use_gemini
         )
         
         if args.json:
@@ -540,7 +604,8 @@ def main():
                     print(f"  #{short['rank']}: {short['title']} (score: {short['score']}, {short['size_mb']}MB)")
                     print(f"      → {short['output_path']}")
                 
-                cache_key = generate_cache_key(args.video_path, args.model_path, args.silence, args.min_score, args.whisper)
+                model_identifier = "gemini" if use_gemini else args.model_path
+                cache_key = generate_cache_key(args.video_path, model_identifier, args.silence, args.min_score, args.whisper)
                 cache_path = get_cache_path(args.output, cache_key)
                 print(f"\n💾 CACHE: {cache_path}")
                 print(f"📄 LOG: {Path(args.output) / 'pipeline.log'}")
